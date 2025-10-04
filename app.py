@@ -182,8 +182,8 @@ for d in _rules.get("doc_types", []):
         "raw": d,
     })
 
-def identify_documents_with_ai(ai_payload: Any) -> List[Dict[str, Any]]:
-    """Parse IA response keeping original fields while ensuring minimal keys."""
+def normalize_ai_documents(ai_payload: Any) -> List[Dict[str, Any]]:
+    """Normalize arbitrary IA payloads into a sanitized list of documents."""
 
     def _extract_payload(data: Any) -> Any:
         if isinstance(data, str):
@@ -662,14 +662,45 @@ def identify_documents_with_ai(
 
     api_key = DEEPSEEK_API_KEY if api_key is None else api_key
     caller = api_caller or call_deepseek_api
-    if not api_key:
-        return {"used_ai": False, "documents": [], "raw_response": None, "prompt": payload}
-    if caller is call_deepseek_api and requests is None:
-        return {"used_ai": False, "documents": [], "raw_response": None, "prompt": payload}
 
+
+    def _error_payload(code: str, message: str, http_status: int = 503) -> Dict[str, Any]:
+        return {
+            "code": code,
+            "message": message,
+            "http_status": http_status,
+        }
+
+    
+    if not api_key:
+        return {
+            "used_ai": False,
+            "documents": [],
+            "raw_response": None,
+            "prompt": payload,
+            "error": _error_payload(
+                "missing_api_key",
+                "DeepSeek API não configurada",
+            ),
+        }
+    if caller is call_deepseek_api and requests is None:
+        return {
+            "used_ai": False,
+            "documents": [],
+            "raw_response": None,
+            "prompt": payload,
+            "error": _error_payload(
+                "missing_requests_dependency",
+                "Dependência 'requests' não disponível para chamadas à IA",
+            ),
+        }
     response = caller(api_key, json.dumps(payload, ensure_ascii=False), max_tokens=max_tokens)
     documents: List[Dict[str, Any]] = []
+    error: Optional[Dict[str, Any]] = None
+    
     if isinstance(response, dict):
+        if response.get("error"):
+            error = _error_payload("ai_error", str(response.get("error")), 502)
         candidate: Optional[Any] = None
         if isinstance(response.get("result_json"), dict):
             candidate = response.get("result_json")
@@ -692,8 +723,23 @@ def identify_documents_with_ai(
                 for item in docs_list:
                     if isinstance(item, dict):
                         documents.append(item)
+        elif error is None:
+            error = _error_payload("unexpected_ai_response", "Resposta da IA em formato inesperado", 502)
+    else:
+        error = _error_payload("invalid_ai_response", "Resposta da IA inválida ou vazia", 502)
 
-    return {"used_ai": True, "documents": documents, "raw_response": response, "prompt": payload}
+    if not documents and error is None:
+        error = _error_payload("empty_ai_documents", "IA não retornou documentos identificados", 424)
+
+    result = {
+        "used_ai": True,
+        "documents": documents,
+        "raw_response": response,
+        "prompt": payload,
+    }
+    if error:
+        result["error"] = error
+    return result
 
 
 # Simple extraction examples (date, cnpj)
@@ -851,6 +897,7 @@ def edital_analisar(req: EditalAnalysisRequest, request: Request):
 
     # get text
     text = ""
+    numero_licitacao: Optional[str] = None
     if req.pdf_base64:
         try:
             pdf_bytes = base64.b64decode(req.pdf_base64)
@@ -860,7 +907,7 @@ def edital_analisar(req: EditalAnalysisRequest, request: Request):
     else:
         text = req.texto or ""
 
-
+    if text:
         numero_licitacao = extract_numero_licitacao(text)
     municipio = extract_municipio(text)
 
@@ -868,18 +915,9 @@ def edital_analisar(req: EditalAnalysisRequest, request: Request):
     if not documentos_section:
         documentos_section = extract_document_section(text)
 
-    normalized_text = normalize_text(text)
     docs: List[Dict[str, Any]] = []
     for doc_def in DOCS:
-        key = doc_def.get("key")
-        if not key:
-            continue
-        entry: Dict[str, Any] = {
-            "key": key,
-            "name": doc_def.get("name") or key,
-            "category": doc_def.get("category"),
-            "status": "aguardando_upload",
-            "obrigatorio": bool(doc_def.get("obrigatorio", False)),
+
         }
         keywords = [kw for kw in doc_def.get("keywords", []) if kw]
         matched_keyword = next((kw for kw in keywords if kw in normalized_text), None)
@@ -895,51 +933,78 @@ def edital_analisar(req: EditalAnalysisRequest, request: Request):
         "cnpj_empresa": req.cnpj_empresa,
     }
     edital_summary = build_edital_summary(text, summary_context)
+    trimmed_docs = [
+        {
+            "key": d.get("key"),
+            "name": d.get("name"),
+            "category": d.get("category"),
+            "obrigatorio": d.get("obrigatorio"),
+        }
+        for d in docs
+    ]
+    ai_doc_result = identify_documents_with_ai(
+        documentos_section or text,
+        edital_summary,
+        trimmed_docs,
+        api_key=DEEPSEEK_API_KEY,
+    )
 
-    ai_doc_result = {"used_ai": False, "documents": [], "raw_response": None, "prompt": None}
-    if DEEPSEEK_API_KEY:
-        trimmed_docs = [
-            {
-                "key": d.get("key"),
-                "name": d.get("name"),
-                "category": d.get("category"),
-                "obrigatorio": d.get("obrigatorio"),
+    ai_docs = []
+    used_ai = False
+    ai_error = None
+    if isinstance(ai_doc_result, dict):
+        ai_docs = ai_doc_result.get("documents") or []
+        used_ai = bool(ai_doc_result.get("used_ai"))
+        ai_error = ai_doc_result.get("error")
+
+    if not used_ai or not ai_docs:
+        error_detail = {
+            "message": "Não foi possível identificar documentos automaticamente.",
+        }
+        status_code = 503
+        if isinstance(ai_error, dict):
+            status_code = int(ai_error.get("http_status", status_code))
+            if ai_error.get("message"):
+                error_detail["reason"] = ai_error.get("message")
+            if ai_error.get("code"):
+                error_detail["code"] = ai_error.get("code")
+        elif ai_error:
+            error_detail["reason"] = str(ai_error)
+        elif used_ai:
+            status_code = 502
+        logger.warning("Identificação automática indisponível: %s", error_detail)
+        raise HTTPException(status_code=status_code, detail=error_detail)
+
+    existing_keys = {d.get("key") for d in docs if d.get("key")}
+    for suggestion in ai_docs:
+        if not isinstance(suggestion, dict):
+            continue
+        key = suggestion.get("key") or suggestion.get("id")
+        if not key or key in existing_keys:
+            continue
+        docs.append(
+
+        {
+            "key": key,
+            "name": suggestion.get("name")
+            or suggestion.get("nome")
+            or key,
+            "category": suggestion.get("category")
+            or suggestion.get("categoria"),
+            "status": "aguardando_upload",
+            "matched_keyword": None,
+            "obrigatorio": bool(suggestion.get("obrigatorio"))
+            if suggestion.get("obrigatorio") is not None
+            else False,
+            "ai_suggestion": True,
             }
-            for d in docs
-        ]
-        ai_doc_result = identify_documents_with_ai(
-            documentos_section or text,
-            edital_summary,
-            trimmed_docs,
-            api_key=DEEPSEEK_API_KEY,
+     
         )
 
-        ai_docs = ai_doc_result.get("documents") or []
-        if ai_docs:
-            existing_keys = {d.get("key") for d in docs if d.get("key")}
-            for suggestion in ai_docs:
-                if not isinstance(suggestion, dict):
-                    continue
-                key = suggestion.get("key") or suggestion.get("id")
-                if not key or key in existing_keys:
-                    continue
-                docs.append(
-                    {
-                        "key": key,
-                        "name": suggestion.get("name")
-                        or suggestion.get("nome")
-                        or key,
-                        "category": suggestion.get("category")
-                        or suggestion.get("categoria"),
-                        "status": "aguardando_upload",
-                        "matched_keyword": None,
-                        "obrigatorio": bool(suggestion.get("obrigatorio"))
-                        if suggestion.get("obrigatorio") is not None
-                        else False,
-                        "ai_suggestion": True,
-                    }
-                )
-                existing_keys.add(key)
+    ai_docs_raw: Any = []
+    if isinstance(ai_doc_result, dict):
+        ai_docs_raw = ai_doc_result.get("documents") or []
+    docs = normalize_ai_documents(ai_docs_raw)
 
     # create session
     session_id = make_session_id()
