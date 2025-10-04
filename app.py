@@ -84,15 +84,30 @@ if not _rules:
         ]
     }
 
+# Utils
+def normalize_text(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    s = s.lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s
+
 # normalize docs list
 DOCS: List[Dict[str, Any]] = []
 for d in _rules.get("doc_types", []):
     key = d.get("key") or d.get("name")
+    keywords = [k.lower() for k in d.get("common_keywords", []) if isinstance(k, str)]
+    # also include normalized variations of the document name to improve recall
+    name_tokens = [tok for tok in normalize_text(d.get("name", "")).split() if len(tok) >= 4]
+    for token in name_tokens:
+        if token and token not in keywords:
+            keywords.append(token)
     DOCS.append({
         "key": key,
         "name": d.get("name", key),
         "category": d.get("category"),
-        "keywords": [k.lower() for k in d.get("common_keywords", []) if isinstance(k, str)],
+        "keywords": keywords,
         "regex_examples": d.get("extraction", {}).get("regex_examples", {}),
         "obrigatorio": bool(d.get("obrigatorio", None) or (d.get("category") in ("juridica","fiscal_trabalhista","proposta"))),
         "raw": d,
@@ -108,6 +123,8 @@ class EditalAnalysisRequest(BaseModel):
 class EditalAnalysisResponse(BaseModel):
     status: str
     session_id: str
+    numero_licitacao: Optional[str] = None
+    municipio: Optional[str] = None
     data_sessao: Optional[str]
     documentos: List[Dict[str, Any]]
 
@@ -124,15 +141,6 @@ class DocumentValidateResponse(BaseModel):
     extracted_fields: Dict[str, Any]
     reasons: List[str]
     cache_hit: bool = False
-
-# Utils
-def normalize_text(s: Optional[str]) -> str:
-    if not s:
-        return ""
-    s = s.lower()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    return s
 
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
@@ -173,18 +181,49 @@ def identify_documents_from_edital(text: str) -> List[Dict[str, Any]]:
     for d in DOCS:
         matched_kw = None
         for kw in d["keywords"]:
-            if kw in t:
+            if kw and kw in t:
                 matched_kw = kw
                 break
-        out.append({
-            "key": d["key"],
-            "name": d["name"],
-            "category": d.get("category"),
-            "status": "aguardando_upload",
-            "matched_keyword": matched_kw,
-            "obrigatorio": bool(doc.get("obrigatorio", False)),
-        })
+        if matched_kw or not d["keywords"]:
+            out.append({
+                "key": d["key"],
+                "name": d["name"],
+                "category": d.get("category"),
+                "status": "aguardando_upload",
+                "matched_keyword": matched_kw,
+                "obrigatorio": bool(d.get("obrigatorio", False)),
+            })
     return out
+
+# Patterns to capture licitação metadata
+LICITACAO_PATTERNS = [
+    re.compile(r"(?:processo(?:\s+licitat[óo]rio)?|preg[aã]o(?: eletr[ôo]nico)?|concorr[êe]ncia|tomada de preços|dispensa(?: de licita[çc][ãa]o)?|edital)\s*(?:n[ºo°\.\-]?\s*)?(\d{1,4}/\d{4})", re.IGNORECASE),
+    re.compile(r"licita[çc][ãa]o\s*(?:n[ºo°\.\-]?\s*)?(\d{1,4}/\d{4})", re.IGNORECASE),
+]
+
+CITY_PATTERNS = [
+    re.compile(r"munic[ií]pio de\s+([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-Za-zÀ-ÖØ-öø-ÿ'\-\s]{2,})", re.IGNORECASE),
+    re.compile(r"prefeitura municipal de\s+([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-Za-zÀ-ÖØ-öø-ÿ'\-\s]{2,})", re.IGNORECASE),
+]
+
+
+def extract_numero_licitacao(text: str) -> Optional[str]:
+    for pattern in LICITACAO_PATTERNS:
+        match = pattern.search(text)
+        if match and match.group(1):
+            return match.group(1).strip()
+    return None
+
+
+def extract_municipio(text: str) -> Optional[str]:
+    for pattern in CITY_PATTERNS:
+        match = pattern.search(text)
+        if match and match.group(1):
+            value = match.group(1).strip()
+            # Normalize spacing but keep original casing for readability
+            value = re.sub(r"\s+", " ", value)
+            return value
+    return None
 
 # Helper to extract small relevant snippets to send to IA
 RELEVANT_TERMS = [
@@ -227,9 +266,39 @@ def extract_cnpj(text: str) -> Optional[str]:
 # Heuristic validator for a known document
 def heuristic_validate(doc_key: str, text: str, session: Dict[str, Any]) -> Dict[str, Any]:
     text_norm = normalize_text(text)
-    extracted = {}
-    reasons = []
+    extracted: Dict[str, Any] = {}
+    reasons: List[str] = []
     result = "amarelo"
+
+    doc_def = next((d for d in DOCS if d["key"] == doc_key), None)
+    if not doc_def:
+        reasons.append("Documento não reconhecido nas regras")
+        return {"result": result, "extracted": extracted, "reasons": reasons}
+
+    doc_name = doc_def.get("name") or doc_key
+    keywords = [kw for kw in doc_def.get("keywords", []) if kw]
+    matched_keyword = None
+    for kw in keywords:
+        if kw in text_norm:
+            matched_keyword = kw
+            break
+
+    if matched_keyword:
+        extracted["matched_keyword"] = matched_keyword
+
+    has_keywords = bool(keywords)
+    recognized_by_keywords = bool(matched_keyword or not has_keywords)
+
+    strict_mismatch_keys = {"cartao_cnpj", "cnd_federal", "crf_fgts", "cndt_trabalhista"}
+    if doc_key.startswith("contrato"):
+        strict_mismatch_keys.add(doc_key)
+
+    if has_keywords and not recognized_by_keywords:
+        reasons.append(
+            f"Palavras-chave esperadas para '{doc_name}' não foram encontradas; o arquivo parece não corresponder ao tipo solicitado."
+        )
+        mismatch_result = "vermelho" if (doc_key in strict_mismatch_keys) else result
+        return {"result": mismatch_result, "extracted": extracted, "reasons": reasons}
 
     # example: certidão (cnd_federal) -> look for "validade" or a date
     if doc_key in ("cnd_federal", "crf_fgts", "cndt_trabalhista"):
@@ -294,22 +363,12 @@ def heuristic_validate(doc_key: str, text: str, session: Dict[str, Any]) -> Dict
             result = "amarelo"
             reasons.append("CNPJ não encontrado no documento")
     else:
-        # generic rule: look for keywords in document
-        doc_def = next((d for d in DOCS if d["key"] == doc_key), None)
-        if doc_def:
-            found = False
-            for kw in doc_def.get("keywords", []):
-                if kw in text_norm:
-                    found = True
-                    break
-            if found:
-                result = "verde"
-            else:
-                result = "amarelo"
-                reasons.append("Conteúdo esperado não localizado via heurística")
+        # generic rule: as palavras-chave já foram verificadas
+        if recognized_by_keywords:
+            result = "verde"
         else:
             result = "amarelo"
-            reasons.append("Documento não reconhecido nas regras")
+            reasons.append("Conteúdo esperado não localizado via heurística")
 
     return {"result": result, "extracted": extracted, "reasons": reasons}
 
@@ -355,6 +414,8 @@ def edital_analisar(req: EditalAnalysisRequest, request: Request):
 
     # identify documents
     docs = identify_documents_from_edital(text)
+    numero_licitacao = extract_numero_licitacao(text)
+    municipio = extract_municipio(text)
 
     # create session
     session_id = make_session_id()
@@ -363,13 +424,23 @@ def edital_analisar(req: EditalAnalysisRequest, request: Request):
         "created_at": datetime.utcnow().isoformat() + "Z",
         "data_sessao": req.data_sessao,
         "cnpj_empresa": req.cnpj_empresa,
+        "numero_licitacao": numero_licitacao,
+        "municipio": municipio,
         "raw_edital_text_snippet": text[:4000],
         "documentos": docs,
         "cache": {},  # hash -> validation result
     }
     save_session(session)
 
-    return EditalAnalysisResponse(status="ok", session_id=session_id, data_sessao=req.data_sessao, documentos=docs)
+    return EditalAnalysisResponse(
+        status="ok",
+        session_id=session_id,
+        data_sessao=req.data_sessao,
+        numero_licitacao=numero_licitacao,
+        municipio=municipio,
+        documentos=docs,
+    )
+
 
 @app.post("/documento/validar", response_model=DocumentValidateResponse)
 def documento_validar(req: DocumentValidateRequest, request: Request):
@@ -428,7 +499,9 @@ def documento_validar(req: DocumentValidateRequest, request: Request):
 
     if need_ai and DEEPSEEK_API_KEY and requests:
         # prepare small prompt/snippet
-        snippet = find_relevant_snippets(text_input or (session.get("raw_edital_text_snippet","")), keywords=DOCS[0].get("keywords",[]))
+        doc_def = next((d for d in DOCS if d["key"] == req.doc_key), None)
+        doc_keywords = doc_def.get("keywords", []) if doc_def else []
+        snippet = find_relevant_snippets(text_input or (session.get("raw_edital_text_snippet","")), keywords=doc_keywords)
         prompt = {
             "task": "validate_document",
             "doc_key": req.doc_key,
