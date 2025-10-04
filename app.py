@@ -16,7 +16,7 @@ HabilitaIA - backend final para protótipo
 - CORS habilitado por padrão
 - Regras (habilitaia_rules.json) lidas se disponíveis
 
-IMPORTANTE: adapte endpoint DEEPSEEK_URL e payload conforme a API real que você contratar.
+
 """
 
 import os
@@ -29,12 +29,14 @@ import tempfile
 import re
 import unicodedata
 import logging
+from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+
 
 # Optional libs
 try:
@@ -43,19 +45,45 @@ except Exception:
     pdfplumber = None
 
 try:
-    import requests
+    from openai import OpenAI
 except Exception:
-    requests = None
+    OpenAI = None
+
 
 # App
 app = FastAPI(title="HabilitaIA - Final")
 
 logger = logging.getLogger(__name__)
 
+
+def _load_env_file(path: str = ".env") -> None:
+    """Populate os.environ com variáveis declaradas em um arquivo .env simples."""
+
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env_file()
+
+
 # Config
 API_KEY = os.environ.get("API_KEY", "ramilo123")
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
-DEEPSEEK_URL = os.environ.get("DEEPSEEK_URL", "https://api.deepseek.example/v1/analyze")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-424f477f6fc546609b83975eb87342df")
+DEEPSEEK_URL = os.environ.get("DEEPSEEK_URL", "https://api.deepseek.com")
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")  # ou "deepseek-reasoner", se preferir
 ENABLE_CORS = os.environ.get("ENABLE_CORS", "1")
 SESSION_DIR = os.environ.get("SESSION_DIR", "/tmp/habilitaia_sessions")
 FILES_DIR = os.environ.get("FILES_DIR", "/tmp/habilitaia_files")
@@ -315,7 +343,7 @@ def identify_documents_with_ai(text: str) -> List[Dict[str, Any]]:
     if not text or not text.strip():
         return []
 
-    if not requests or not DEEPSEEK_API_KEY:
+    if not OpenAI or not DEEPSEEK_API_KEY:
         return []
 
     prompt = {
@@ -360,8 +388,8 @@ def identify_documents_with_ai(section_text: str) -> List[Dict[str, Any]]:
     if not section_text or not section_text.strip():
         return []
 
-    if not requests or not DEEPSEEK_API_KEY:
-        logger.warning("IA indisponível para identificar documentos (requests=%s, api_key=%s)", bool(requests), bool(DEEPSEEK_API_KEY))
+    if not OpenAI or not DEEPSEEK_API_KEY:
+        logger.warning("IA indisponível para identificar documentos (openai_sdk=%s, api_key=%s)", bool(OpenAI), bool(DEEPSEEK_API_KEY))
         return []
 
     catalog = [
@@ -683,15 +711,15 @@ def identify_documents_with_ai(
                 "DeepSeek API não configurada",
             ),
         }
-    if caller is call_deepseek_api and requests is None:
+    if caller is call_deepseek_api and OpenAI is None:
         return {
             "used_ai": False,
             "documents": [],
             "raw_response": None,
             "prompt": payload,
             "error": _error_payload(
-                "missing_requests_dependency",
-                "Dependência 'requests' não disponível para chamadas à IA",
+                "missing_openai_dependency",
+                "Dependência 'openai' não disponível para chamadas à IA",
             ),
         }
     response = caller(api_key, json.dumps(payload, ensure_ascii=False), max_tokens=max_tokens)
@@ -868,24 +896,58 @@ def heuristic_validate(doc_key: str, text: str, session: Dict[str, Any]) -> Dict
 
 # DeepSeek integration (minimal, token-conscious)
 def call_deepseek_api(api_key: str, prompt: str, max_tokens: int = 150) -> Optional[Dict[str, Any]]:
-    if not requests:
-        return {"error": "requests não disponível"}
+    if OpenAI is None:
+        return {"error": "SDK OpenAI não disponível"}
     if not api_key:
         return {"error": "DEEPSEEK_API_KEY não configurada"}
-    payload = {
-        "input": prompt,
-        "max_tokens": max_tokens,
-        "temperature": 0,
-        "response_format": "json"  # ask for structured output if supported
-    }
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
     try:
-        r = requests.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=15)
-        if r.status_code != 200:
-            return {"error": f"DeepSeek API retornou {r.status_code}", "text": r.text}
-        return r.json()
+        client = OpenAI(
+            api_key=api_key,
+            base_url=DEEPSEEK_URL or "https://api.deepseek.com",
+        )
     except Exception as e:
+        logger.exception("Falha ao inicializar cliente DeepSeek")
+        return {"error": f"Falha ao inicializar cliente: {e}"}
+
+    system_prompt = (
+        "Você é um assistente especializado em licitações brasileiras. "
+        "Responda estritamente em JSON válido."
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=max_tokens,
+            temperature=0,
+            stream=False,
+        )
+    except Exception as e:
+        logger.exception("Erro ao chamar DeepSeek")
         return {"error": str(e)}
+
+    try:
+        content = response.choices[0].message.content  # type: ignore[index]
+    except (AttributeError, IndexError, KeyError):
+        content = None
+
+    if not content:
+        return {"error": "Resposta vazia da DeepSeek"}
+
+    try:
+        parsed_content = json.loads(content)
+    except Exception:
+        return {"text": content}
+
+    if isinstance(parsed_content, dict):
+        return parsed_content
+
+    return {"output": parsed_content}
+
 
 # Endpoints
 @app.post("/edital/analisar", response_model=EditalAnalysisResponse)
@@ -1105,7 +1167,7 @@ def documento_validar(req: DocumentValidateRequest, request: Request):
     # decide if we need IA: only if heuristica inconclusiva (amarelo) or missing important fields
     need_ai = (result == "amarelo")
 
-    if need_ai and DEEPSEEK_API_KEY and requests:
+    if need_ai and DEEPSEEK_API_KEY and OpenAI:
         # prepare small prompt/snippet
         doc_def = next((d for d in DOCS if d["key"] == req.doc_key), None)
         doc_keywords = doc_def.get("keywords", []) if doc_def else []
