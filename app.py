@@ -859,7 +859,34 @@ def edital_analisar(req: EditalAnalysisRequest, request: Request):
             raise HTTPException(status_code=400, detail=f"Erro extraindo PDF: {e}")
     else:
         text = req.texto or ""
-        
+
+
+        numero_licitacao = extract_numero_licitacao(text)
+    municipio = extract_municipio(text)
+
+    documentos_section = extract_documentos_habilitacao_section(text)
+    if not documentos_section:
+        documentos_section = extract_document_section(text)
+
+    normalized_text = normalize_text(text)
+    docs: List[Dict[str, Any]] = []
+    for doc_def in DOCS:
+        key = doc_def.get("key")
+        if not key:
+            continue
+        entry: Dict[str, Any] = {
+            "key": key,
+            "name": doc_def.get("name") or key,
+            "category": doc_def.get("category"),
+            "status": "aguardando_upload",
+            "obrigatorio": bool(doc_def.get("obrigatorio", False)),
+        }
+        keywords = [kw for kw in doc_def.get("keywords", []) if kw]
+        matched_keyword = next((kw for kw in keywords if kw in normalized_text), None)
+        if matched_keyword:
+            entry["matched_keyword"] = matched_keyword
+        docs.append(entry)
+
     # Build compact summary for prompts / logging
     summary_context = {
         "numero_licitacao": numero_licitacao,
@@ -881,7 +908,7 @@ def edital_analisar(req: EditalAnalysisRequest, request: Request):
             for d in docs
         ]
         ai_doc_result = identify_documents_with_ai(
-            text,
+            documentos_section or text,
             edital_summary,
             trimmed_docs,
             api_key=DEEPSEEK_API_KEY,
