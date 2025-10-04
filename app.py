@@ -916,8 +916,15 @@ def edital_analisar(req: EditalAnalysisRequest, request: Request):
         documentos_section = extract_document_section(text)
 
     docs: List[Dict[str, Any]] = []
+    normalized_text = normalize_text(documentos_section or text)
     for doc_def in DOCS:
-
+        entry = {
+            "key": doc_def.get("key"),
+            "name": doc_def.get("name"),
+            "category": doc_def.get("category"),
+            "status": "aguardando_upload",
+            "obrigatorio": doc_def.get("obrigatorio"),
+            "matched_keyword": None,
         }
         keywords = [kw for kw in doc_def.get("keywords", []) if kw]
         matched_keyword = next((kw for kw in keywords if kw in normalized_text), None)
