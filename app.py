@@ -2,7 +2,7 @@
 HabilitaIA - backend final para protótipo
 
 - Dois passos:
-  1) /edital/analisar -> recebe texto do edital (ou pdf b64), extrai se preciso, aplica heurística para listar documentos exigidos
+  1) /edital/analisar -> recebe texto do edital (ou pdf b64), extrai se preciso e usa IA para listar documentos exigidos
      -> salva sessão temporária em /tmp/habilitaia_sessions/<session>.json com os parâmetros extraídos (data_sessao, cnpj, lista esperada etc.)
      -> retorna session_id e lista de documentos com status "aguardando_upload"
 
@@ -28,6 +28,7 @@ import zipfile
 import tempfile
 import re
 import unicodedata
+import logging
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 
@@ -48,6 +49,8 @@ except Exception:
 
 # App
 app = FastAPI(title="HabilitaIA - Final")
+
+logger = logging.getLogger(__name__)
 
 # Config
 API_KEY = os.environ.get("API_KEY", "ramilo123")
@@ -93,6 +96,72 @@ def normalize_text(s: Optional[str]) -> str:
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     return s
 
+
+def strip_accents(text: Optional[str]) -> str:
+    """Return text without diacritics while preserving original casing."""
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+
+def _is_uppercase_heading(line: str) -> bool:
+    """Heuristic to detect uppercase headings that delimit edital sections."""
+    stripped = line.strip()
+    if len(stripped) < 4:
+        return False
+    normalized = strip_accents(stripped)
+    if not any(ch.isalpha() for ch in normalized):
+        return False
+    return normalized == normalized.upper()
+
+
+
+def extract_documentos_habilitacao_section(texto: str) -> str:
+    """Return only the "DOCUMENTOS DE HABILITAÇÃO" block (up to next heading or 4000 chars)."""
+    if not texto:
+        return ""
+
+    texto_sem_acentos = strip_accents(texto)
+    texto_normalizado = texto_sem_acentos.upper()
+
+    patterns = [
+        re.compile(r"\bDOCUMENTOS?\s+(?:DE|PARA|DA|DO)\s+HABILITACAO\b"),
+        re.compile(r"\bDOCUMENTACAO\s+(?:DE|PARA|DA|DO)\s+HABILITACAO\b"),
+        re.compile(r"\bHABILITACAO\s+DOCUMENTOS?\b"),
+    ]
+
+    match = None
+    for pattern in patterns:
+        match = pattern.search(texto_normalizado)
+        if match:
+            break
+
+    if not match:
+        return ""
+
+    start_idx = match.start()
+    subseq = texto[start_idx:]
+    max_len = 4000
+    collected_lines: List[str] = []
+    current_len = 0
+    first_line = True
+
+    for line in subseq.splitlines(True):
+        if not first_line and _is_uppercase_heading(line):
+            break
+        collected_lines.append(line)
+        current_len += len(line)
+        if current_len >= max_len:
+            break
+        first_line = False
+
+    section = "".join(collected_lines)
+    if len(section) > max_len:
+        section = section[:max_len]
+    return section.strip()
+
+
 # normalize docs list
 DOCS: List[Dict[str, Any]] = []
 for d in _rules.get("doc_types", []):
@@ -109,9 +178,76 @@ for d in _rules.get("doc_types", []):
         "category": d.get("category"),
         "keywords": keywords,
         "regex_examples": d.get("extraction", {}).get("regex_examples", {}),
-        "obrigatorio": bool(d.get("obrigatorio", None) or (d.get("category") in ("juridica","fiscal_trabalhista","proposta"))),
+        "obrigatorio": bool(d.get("obrigatorio", None) or (d.get("category") in ("juridica", "fiscal_trabalhista", "proposta"))),
         "raw": d,
     })
+
+def identify_documents_with_ai(ai_payload: Any) -> List[Dict[str, Any]]:
+    """Parse IA response keeping original fields while ensuring minimal keys."""
+
+    def _extract_payload(data: Any) -> Any:
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except Exception:
+                return []
+        if isinstance(data, dict):
+            # Nested outputs such as {"output": {...}} or {"result_json": {...}}
+            for key in ("result_json", "output", "data"):
+                inner = data.get(key)
+                if isinstance(inner, (dict, list)):
+                    extracted = _extract_payload(inner)
+                    if extracted:
+                        return extracted
+            for key in ("documents", "documentos", "docs", "itens", "items"):
+                docs = data.get(key)
+                if isinstance(docs, list):
+                    return docs
+            # If the dict itself resembles a document, wrap it
+            if {"key", "name"}.issubset(set(data.keys())):
+                return [data]
+            return []
+        if isinstance(data, list):
+            return data
+        return []
+
+    raw_documents = _extract_payload(ai_payload)
+    if not isinstance(raw_documents, list):
+        return []
+
+    parsed: List[Dict[str, Any]] = []
+    for item in raw_documents:
+        if not isinstance(item, dict):
+            continue
+        # Work on a shallow copy so we do not mutate caller-provided structures
+        doc = dict(item)
+
+        # Resolve document key (accept alternate aliases and keep whatever the IA provided)
+        key = doc.get("key") or doc.get("id") or doc.get("codigo") or doc.get("code")
+        if key is None:
+            # no identifiable key -> skip silently
+            continue
+        doc.setdefault("key", str(key))
+        if not isinstance(doc["key"], str):
+            doc["key"] = str(doc["key"])
+
+        # Name/description: keep original naming but ensure "name" exists for compatibility
+        if "name" not in doc:
+            alt_name = doc.get("nome") or doc.get("descricao") or doc.get("description")
+            if alt_name:
+                doc["name"] = alt_name
+
+        # Category: accept "categoria" while preserving original field names
+        if "category" not in doc and doc.get("categoria") is not None:
+            doc["category"] = doc["categoria"]
+
+        # Status defaults to aguardando_upload if IA omits it
+        doc.setdefault("status", "aguardando_upload")
+
+        parsed.append(doc)
+
+    return parsed
+
 
 # Models
 class EditalAnalysisRequest(BaseModel):
@@ -173,27 +309,141 @@ def load_session(session_id: str) -> Dict[str, Any]:
     with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
 
-# Heuristics for edital parsing (step 1)
-def identify_documents_from_edital(text: str) -> List[Dict[str, Any]]:
-    """Return list of documents with status 'aguardando_upload' and metadata"""
-    t = normalize_text(text)
-    out = []
-    for d in DOCS:
-        matched_kw = None
-        for kw in d["keywords"]:
-            if kw and kw in t:
-                matched_kw = kw
+# IA para identificação de documentos no edital (step 1)
+def identify_documents_with_ai(text: str) -> List[Dict[str, Any]]:
+    """Consulta a IA para identificar documentos mencionados no edital."""
+    if not text or not text.strip():
+        return []
+
+    if not requests or not DEEPSEEK_API_KEY:
+        return []
+
+    prompt = {
+        "task": "identify_required_documents",
+        "instructions": (
+            "Analise o texto do edital e retorne uma lista JSON com os documentos "
+            "necessários. Cada item deve conter ao menos os campos 'key', 'name', "
+            "'category' (opcional), 'status'='aguardando_upload' e 'obrigatorio' (bool)."
+        ),
+        "text": text[:8000],
+    }
+
+    ai_out = call_deepseek_api(DEEPSEEK_API_KEY, json.dumps(prompt), max_tokens=400)
+    if not ai_out or ai_out.get("error"):
+        return []
+
+    def _coerce_list(value: Any) -> Optional[List[Dict[str, Any]]]:
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        return None
+
+    parsed: Optional[List[Dict[str, Any]]] = None
+    if isinstance(ai_out, dict):
+        for key in ("documents", "result", "output", "data"):
+            parsed = _coerce_list(ai_out.get(key))
+            if parsed is not None:
                 break
-        if matched_kw or not d["keywords"]:
-            out.append({
-                "key": d["key"],
-                "name": d["name"],
-                "category": d.get("category"),
-                "status": "aguardando_upload",
-                "matched_keyword": matched_kw,
-                "obrigatorio": bool(d.get("obrigatorio", False)),
-            })
-    return out
+        if parsed is None:
+            text_field = ai_out.get("text") or ai_out.get("output_text")
+            if isinstance(text_field, str):
+                try:
+                    parsed_candidate = json.loads(text_field)
+                    parsed = _coerce_list(parsed_candidate)
+                except Exception:
+                    parsed = None
+
+    return parsed or []
+
+
+def identify_documents_with_ai(section_text: str) -> List[Dict[str, Any]]:
+    """Use DeepSeek API to classify required documents from the extracted section."""
+    if not section_text or not section_text.strip():
+        return []
+
+    if not requests or not DEEPSEEK_API_KEY:
+        logger.warning("IA indisponível para identificar documentos (requests=%s, api_key=%s)", bool(requests), bool(DEEPSEEK_API_KEY))
+        return []
+
+    catalog = [
+        {
+            "key": d["key"],
+            "name": d.get("name", d["key"]),
+            "obrigatorio": bool(d.get("obrigatorio", False)),
+        }
+        for d in DOCS
+    ]
+
+    prompt = {
+        "task": "identify_edital_documents",
+        "catalog": catalog,
+        "section": section_text.strip()[:4000],
+        "instructions": "Leia a seção do edital e retorne JSON {'documentos': [{'key': str, 'status': 'aguardando_upload', 'obrigatorio': bool, 'justificativa': opcional}]}. Ignore documentos fora do catálogo.",
+    }
+
+    prompt_text = json.dumps(prompt, ensure_ascii=False)
+
+    ai_out = call_deepseek_api(DEEPSEEK_API_KEY, prompt_text, max_tokens=200)
+    if not ai_out or ai_out.get("error"):
+        logger.warning("Falha ao consultar IA para documentos de habilitação: %s", ai_out.get("error") if isinstance(ai_out, dict) else "unknown")
+        return []
+
+    parsed: Optional[Dict[str, Any]] = None
+    if isinstance(ai_out, dict):
+        if isinstance(ai_out.get("result_json"), dict):
+            parsed = ai_out.get("result_json")
+        elif isinstance(ai_out.get("output"), dict):
+            parsed = ai_out.get("output")
+        else:
+            text_candidate = None
+            for key in ("text", "output_text", "output"):
+                value = ai_out.get(key)
+                if isinstance(value, str):
+                    text_candidate = value
+                    break
+            if text_candidate:
+                try:
+                    parsed = json.loads(text_candidate)
+                except Exception:
+                    logger.warning("Não foi possível interpretar resposta textual da IA")
+                    return []
+
+    if not parsed or not isinstance(parsed, dict):
+        logger.warning("Resposta da IA em formato inesperado: %s", ai_out)
+        return []
+
+    documentos_brutos = parsed.get("documentos")
+    if not isinstance(documentos_brutos, list):
+        logger.warning("IA não retornou lista de documentos válida")
+        return []
+
+    doc_map = {d["key"]: d for d in DOCS}
+    seen: set = set()
+    documentos_processados: List[Dict[str, Any]] = []
+
+    for item in documentos_brutos:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("key")
+        if not key or key not in doc_map or key in seen:
+            continue
+        seen.add(key)
+        doc_def = doc_map[key]
+        entry = {
+            "key": key,
+            "name": item.get("name") or doc_def.get("name") or key,
+            "category": doc_def.get("category"),
+            "status": item.get("status") or "aguardando_upload",
+            "obrigatorio": bool(item.get("obrigatorio", doc_def.get("obrigatorio", False))),
+        }
+        justificativa = item.get("justificativa")
+        if justificativa:
+            entry["ia_justificativa"] = justificativa
+        if item.get("confidence") is not None:
+            entry["ia_confidence"] = item.get("confidence")
+        documentos_processados.append(entry)
+
+    return documentos_processados
+
 
 # Patterns to capture licitação metadata
 LICITACAO_PATTERNS = [
@@ -204,6 +454,24 @@ LICITACAO_PATTERNS = [
 CITY_PATTERNS = [
     re.compile(r"munic[ií]pio de\s+([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-Za-zÀ-ÖØ-öø-ÿ'\-\s]{2,})", re.IGNORECASE),
     re.compile(r"prefeitura municipal de\s+([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-Za-zÀ-ÖØ-öø-ÿ'\-\s]{2,})", re.IGNORECASE),
+]
+
+VALOR_PATTERN = re.compile(
+    r"(?:valor(?:\s+estimado)?|estimado em|montante)\s*(?:de|do|da|no)?\s*(R\$\s?[\d\.,]+)",
+    re.IGNORECASE,
+)
+
+MODALIDADE_PATTERNS = [
+    re.compile(r"modalidade\s*[:\-]?\s*([A-Za-zÀ-ÖØ-öø-ÿ'\s]{3,60})", re.IGNORECASE),
+    re.compile(
+        r"(preg[aã]o eletr[ôo]nico|preg[aã]o presencial|concorr[êe]ncia p[úu]blica|tomada de preços|dispensa de licita[çc][ãa]o)",
+        re.IGNORECASE,
+    ),
+]
+
+OBJETO_PATTERNS = [
+    re.compile(r"objeto\s*[:\-]\s*(.{20,220})", re.IGNORECASE | re.DOTALL),
+    re.compile(r"tem por objeto\s*(.{20,220})", re.IGNORECASE | re.DOTALL),
 ]
 
 
@@ -224,6 +492,116 @@ def extract_municipio(text: str) -> Optional[str]:
             value = re.sub(r"\s+", " ", value)
             return value
     return None
+
+
+def extract_valor_estimado(text: str) -> Optional[str]:
+    match = VALOR_PATTERN.search(text)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def extract_modalidade(text: str) -> Optional[str]:
+    for pattern in MODALIDADE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = match.group(1).strip()
+            value = re.sub(r"\s+", " ", value)
+            return value
+    return None
+
+
+def extract_objeto(text: str) -> Optional[str]:
+    for pattern in OBJETO_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = match.group(1).strip()
+            value = value.split("\n")[0]
+            if len(value) > 200:
+                value = value[:200].rstrip() + "…"
+            return value
+    return None
+
+
+SUMMARY_FIELD_ORDER = [
+    "numero_licitacao",
+    "data_sessao",
+    "municipio",
+    "modalidade",
+    "objeto",
+    "valor_estimado",
+    "cnpj_empresa",
+]
+SUMMARY_FIELD_MAX_CHARS = 160
+SUMMARY_TOTAL_MAX_CHARS = 600
+
+DOC_SECTION_KEYWORDS = [
+    r"documentos exigidos",
+    r"documenta[çc][ãa]o exigida",
+    r"habilita[çc][ãa]o",
+    r"documenta[çc][ãa]o complementar",
+]
+DOC_SECTION_MAX_CHARS = 1800
+DOC_SECTION_PADDING = 200
+
+
+def _truncate_value(value: Optional[str], max_chars: int) -> Optional[str]:
+    if not value:
+        return None
+    value = value.strip()
+    if len(value) <= max_chars:
+        return value
+    return value[: max_chars - 1].rstrip() + "…"
+
+
+def build_edital_summary(text: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    """Compacta metadados do edital para envio junto ao prompt da IA."""
+
+    context = context or {}
+    numero = context.get("numero_licitacao") or extract_numero_licitacao(text)
+    municipio = context.get("municipio") or extract_municipio(text)
+    data_sessao = context.get("data_sessao")
+    modalidade = context.get("modalidade") or extract_modalidade(text)
+    objeto = context.get("objeto") or extract_objeto(text)
+    valor = context.get("valor_estimado") or extract_valor_estimado(text)
+    cnpj = context.get("cnpj_empresa") or extract_cnpj(text)
+
+    raw = {
+        "numero_licitacao": numero,
+        "data_sessao": data_sessao,
+        "municipio": municipio,
+        "modalidade": modalidade,
+        "objeto": objeto,
+        "valor_estimado": valor,
+        "cnpj_empresa": cnpj,
+    }
+
+    summary: Dict[str, str] = {}
+    total_chars = 0
+    for field in SUMMARY_FIELD_ORDER:
+        value = _truncate_value(raw.get(field), SUMMARY_FIELD_MAX_CHARS)
+        if not value:
+            continue
+        projected_total = total_chars + len(field) + len(value)
+        if projected_total > SUMMARY_TOTAL_MAX_CHARS:
+            continue
+        summary[field] = value
+        total_chars = projected_total
+    return summary
+
+
+def extract_document_section(text: str, max_chars: int = DOC_SECTION_MAX_CHARS) -> str:
+    """Retorna apenas o trecho mais relevante sobre documentos para envio à IA."""
+
+    for pattern in DOC_SECTION_KEYWORDS:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            start = max(0, match.start() - DOC_SECTION_PADDING)
+            end = min(len(text), start + max_chars)
+            return text[start:end]
+    return text[:max_chars]
+
+
 
 # Helper to extract small relevant snippets to send to IA
 RELEVANT_TERMS = [
@@ -247,6 +625,76 @@ def find_relevant_snippets(text: str, keywords: List[str], window: int = 400) ->
     # join unique snippets
     joined = "\n---\n".join(dict.fromkeys(hits))
     return joined[:2000]
+
+def identify_documents_with_ai(
+    text: str,
+    summary: Dict[str, str],
+    existing_docs: Optional[List[Dict[str, Any]]] = None,
+    *,
+    api_key: Optional[str] = None,
+    api_caller=None,
+    max_tokens: int = 320,
+) -> Dict[str, Any]:
+    """Utiliza IA para complementar a identificação de documentos.
+
+    O payload enviado à IA contém:
+      - ``summary``: metadados compactados (numero, data, município, modalidade, objeto, valor, CNPJ).
+      - ``document_section``: apenas o trecho relevante sobre documentação, limitado a ``DOC_SECTION_MAX_CHARS``.
+      - ``known_documents``: lista atual de documentos identificados heurísticamente.
+      - ``instructions``: orientação para retornar JSON estruturado ``{"documents": [...]}``.
+    """
+
+    existing_docs = existing_docs or []
+    prompt_summary = summary or {}
+    snippet = extract_document_section(text)
+
+    payload = {
+        "task": "identify_required_documents",
+        "summary": prompt_summary,
+        "document_section": snippet,
+        "known_documents": existing_docs,
+        "instructions": (
+            "Use o campo `summary` com metadados compactos do edital (numero, data, municipio, modalidade, objeto, valor, CNPJ). "
+            "Analise exclusivamente o trecho `document_section` e responda JSON no formato {\"documents\": [{\"key\": str, \"name\": str, "
+            "\"category\": str|null, \"obrigatorio\": bool, \"observacoes\": str?}]}."
+        ),
+    }
+
+    api_key = DEEPSEEK_API_KEY if api_key is None else api_key
+    caller = api_caller or call_deepseek_api
+    if not api_key:
+        return {"used_ai": False, "documents": [], "raw_response": None, "prompt": payload}
+    if caller is call_deepseek_api and requests is None:
+        return {"used_ai": False, "documents": [], "raw_response": None, "prompt": payload}
+
+    response = caller(api_key, json.dumps(payload, ensure_ascii=False), max_tokens=max_tokens)
+    documents: List[Dict[str, Any]] = []
+    if isinstance(response, dict):
+        candidate: Optional[Any] = None
+        if isinstance(response.get("result_json"), dict):
+            candidate = response.get("result_json")
+        elif isinstance(response.get("output"), dict):
+            candidate = response.get("output")
+        elif isinstance(response.get("output"), list):
+            candidate = {"documents": response.get("output")}
+        else:
+            for key in ("text", "output_text", "output"):
+                txt = response.get(key)
+                if isinstance(txt, str):
+                    try:
+                        candidate = json.loads(txt)
+                        break
+                    except Exception:
+                        continue
+        if isinstance(candidate, dict):
+            docs_list = candidate.get("documents") or candidate.get("documentos")
+            if isinstance(docs_list, list):
+                for item in docs_list:
+                    if isinstance(item, dict):
+                        documents.append(item)
+
+    return {"used_ai": True, "documents": documents, "raw_response": response, "prompt": payload}
+
 
 # Simple extraction examples (date, cnpj)
 DATE_PATTERNS = [r"(\d{2}/\d{2}/\d{4})", r"(\d{4}-\d{2}-\d{2})"]
@@ -411,11 +859,60 @@ def edital_analisar(req: EditalAnalysisRequest, request: Request):
             raise HTTPException(status_code=400, detail=f"Erro extraindo PDF: {e}")
     else:
         text = req.texto or ""
+        
+    # Build compact summary for prompts / logging
+    summary_context = {
+        "numero_licitacao": numero_licitacao,
+        "municipio": municipio,
+        "data_sessao": req.data_sessao,
+        "cnpj_empresa": req.cnpj_empresa,
+    }
+    edital_summary = build_edital_summary(text, summary_context)
 
-    # identify documents
-    docs = identify_documents_from_edital(text)
-    numero_licitacao = extract_numero_licitacao(text)
-    municipio = extract_municipio(text)
+    ai_doc_result = {"used_ai": False, "documents": [], "raw_response": None, "prompt": None}
+    if DEEPSEEK_API_KEY:
+        trimmed_docs = [
+            {
+                "key": d.get("key"),
+                "name": d.get("name"),
+                "category": d.get("category"),
+                "obrigatorio": d.get("obrigatorio"),
+            }
+            for d in docs
+        ]
+        ai_doc_result = identify_documents_with_ai(
+            text,
+            edital_summary,
+            trimmed_docs,
+            api_key=DEEPSEEK_API_KEY,
+        )
+
+        ai_docs = ai_doc_result.get("documents") or []
+        if ai_docs:
+            existing_keys = {d.get("key") for d in docs if d.get("key")}
+            for suggestion in ai_docs:
+                if not isinstance(suggestion, dict):
+                    continue
+                key = suggestion.get("key") or suggestion.get("id")
+                if not key or key in existing_keys:
+                    continue
+                docs.append(
+                    {
+                        "key": key,
+                        "name": suggestion.get("name")
+                        or suggestion.get("nome")
+                        or key,
+                        "category": suggestion.get("category")
+                        or suggestion.get("categoria"),
+                        "status": "aguardando_upload",
+                        "matched_keyword": None,
+                        "obrigatorio": bool(suggestion.get("obrigatorio"))
+                        if suggestion.get("obrigatorio") is not None
+                        else False,
+                        "ai_suggestion": True,
+                    }
+                )
+                existing_keys.add(key)
 
     # create session
     session_id = make_session_id()
@@ -426,10 +923,22 @@ def edital_analisar(req: EditalAnalysisRequest, request: Request):
         "cnpj_empresa": req.cnpj_empresa,
         "numero_licitacao": numero_licitacao,
         "municipio": municipio,
+        "modalidade": edital_summary.get("modalidade"),
+        "valor_estimado": edital_summary.get("valor_estimado"),
+        "objeto": edital_summary.get("objeto"),
+        "edital_summary": edital_summary,
+        "ai_document_identification": {
+            "used_ai": ai_doc_result.get("used_ai", False),
+        },
         "raw_edital_text_snippet": text[:4000],
+        "documentos_section": documentos_section,
         "documentos": docs,
         "cache": {},  # hash -> validation result
     }
+    if ai_doc_result.get("prompt"):
+        session["ai_document_identification"]["prompt"] = ai_doc_result.get("prompt")
+    if ai_doc_result.get("raw_response"):
+        session["ai_document_identification"]["raw_response"] = ai_doc_result.get("raw_response")
     save_session(session)
 
     return EditalAnalysisResponse(
@@ -501,7 +1010,13 @@ def documento_validar(req: DocumentValidateRequest, request: Request):
         # prepare small prompt/snippet
         doc_def = next((d for d in DOCS if d["key"] == req.doc_key), None)
         doc_keywords = doc_def.get("keywords", []) if doc_def else []
-        snippet = find_relevant_snippets(text_input or (session.get("raw_edital_text_snippet","")), keywords=doc_keywords)
+        context_candidates = [
+            text_input,
+            session.get("documentos_section"),
+            session.get("raw_edital_text_snippet", ""),
+        ]
+        context_source = next((c for c in context_candidates if c), "")
+        snippet = find_relevant_snippets(context_source, keywords=doc_keywords)
         prompt = {
             "task": "validate_document",
             "doc_key": req.doc_key,
